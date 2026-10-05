@@ -119,19 +119,30 @@ class MeteredLLM:
         if self.chat_provider == "anthropic":
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
+            response = None
+            for attempt in range(6):
+                try:
+                    if json_mode and self.chat_provider != "gemini":
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                            max_tokens=2000,
+                        )
+                    else:
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            max_tokens=2000,
+                        )
+                    break
+                except Exception as error:
+                    if ("429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)) and attempt < 5:
+                        time.sleep(12 + attempt * 5)
+                    else:
+                        raise
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -144,7 +155,7 @@ class MeteredLLM:
         # Server-side fallback re-runs a policy-declined request on another model inside the same call.
         response = self._chat_client.beta.messages.create(
             model=self.chat_model_id,
-            max_tokens=16000,
+            max_tokens=2000,
             output_config={"effort": "low"},
             betas=["server-side-fallback-2026-07-01"],
             extra_body={"fallbacks": "default"},
@@ -157,10 +168,19 @@ class MeteredLLM:
         return text, response.model, response.usage.input_tokens, response.usage.output_tokens
 
     def embed(self, text: str) -> list[float]:
+        time.sleep(0.35)
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        response = None
+        for attempt in range(6):
+            try:
+                response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+                break
+            except Exception as error:
+                if ("429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)) and attempt < 5:
+                    time.sleep(12 + attempt * 5)
+                else:
+                    raise
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
-        self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
 
     __call__ = embed

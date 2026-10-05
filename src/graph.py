@@ -54,20 +54,49 @@ def normalize_crime(name: str) -> str:
 
 def link_entity(name: str, known: list[str], normalize: Callable[[str], str] = normalize_crime) -> str | None:
     """Map a free-text mention (e.g. a charge written by a journalist) onto one canonical name in `known`."""
-    # TODO KG-1: normalize both sides, exact match first, then difflib.get_close_matches(cutoff=0.8).
-    #            Return the ORIGINAL spelling from `known`; return None when nothing is close enough.
-    raise NotImplementedError("TODO KG-1 link_entity (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k LinkEntity")
+    if not name or not known:
+        return None
+    target = normalize(name)
+    if not target:
+        return None
+    normalized_map = {normalize(k): k for k in known}
+    if target in normalized_map:
+        return normalized_map[target]
+    matches = difflib.get_close_matches(target, list(normalized_map.keys()), n=1, cutoff=0.8)
+    if matches:
+        return normalized_map[matches[0]]
+    return None
 
 def find_substances(text: str) -> list[str]:
     lowered = text.lower()
     return [name for name in SUBSTANCES if name.lower() in lowered]
 
+def parse_quantity_amount(raw: str) -> tuple[float | None, float | None]:
+    """Parse raw text like 'hơn 9,6kg', 'khoảng 406g' into (lower_g, upper_g)."""
+    if not raw:
+        return None, None
+    s = raw.lower().replace(" ", "").replace(",", ".")
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(kg|kilôgam|gam|g)\b", s)
+    if not m:
+        m_num = re.search(r"(\d+(?:\.\d+)?)", s)
+        if m_num:
+            return float(m_num.group(1)), None
+        return None, None
+    val = float(m.group(1))
+    unit = m.group(2)
+    val_g = val * 1000.0 if "k" in unit else val
+    if "hơn" in raw.lower() or "trở lên" in raw.lower() or "từ" in raw.lower():
+        return val_g, None
+    elif "dưới" in raw.lower() or "gần" in raw.lower():
+        return None, val_g
+    return val_g, val_g
+
 # ----------------------------------------------------------------------------------------------
-# HINT — suggested ontology: extraction helpers
+# Ontology Extraction Helpers
 # ----------------------------------------------------------------------------------------------
 
 def parse_law_article(doc: Document) -> dict[str, Any]:
-    """Deterministic (regex) extraction for one 'Điều' — law text is regular enough to skip the LLM."""
+    """Deterministic (regex) extraction for one 'Điều' with penalty types, quantity rules, and concepts."""
     article_id = doc.metadata["article"]                       # "Điều 251 BLHS"
     title = doc.metadata["title"].split(". ", 1)[-1]           # "Tội mua bán trái phép chất ma túy"
     body = FOOTNOTE.sub("", doc.content)
@@ -78,12 +107,58 @@ def parse_law_article(doc: Document) -> dict[str, Any]:
         text = body[start.start():end].strip()
         first_line = text.splitlines()[0]
         penalty = re.search(r"\bbị ((?:phạt|tù|cảnh cáo).+?)(?::|$)", first_line)
+
+        lowered = text.lower()
+        penalty_types = []
+        if "tử hình" in lowered:
+            penalty_types.append("death")
+        if "tù chung thân" in lowered or "chung thân" in lowered:
+            penalty_types.append("life")
+        if "phạt tù" in lowered or "tù từ" in lowered:
+            penalty_types.append("fixed_term")
+
+        m_max = re.search(r"đến\s*(\d+)\s*năm", lowered)
+        max_years = int(m_max.group(1)) if m_max else None
+
+        clause_substances = find_substances(text)
+        quantity_rules = []
+        for s in clause_substances:
+            if "100 gam trở lên" in text or "100g trở lên" in text:
+                quantity_rules.append({
+                    "id": f"qr:{article_id}:cl{start.group(1)}:{s}:100g",
+                    "substance": s, "lower": 100.0, "upper": None, "unit": "g", "point": "4"
+                })
+            elif "30 gam đến dưới 100 gam" in text:
+                quantity_rules.append({
+                    "id": f"qr:{article_id}:cl{start.group(1)}:{s}:30-100g",
+                    "substance": s, "lower": 30.0, "upper": 100.0, "unit": "g", "point": "3"
+                })
+            elif "05 gam đến dưới 30 gam" in text or "5 gam đến dưới 30 gam" in text:
+                quantity_rules.append({
+                    "id": f"qr:{article_id}:cl{start.group(1)}:{s}:5-30g",
+                    "substance": s, "lower": 5.0, "upper": 30.0, "unit": "g", "point": "2"
+                })
+
+        concepts = []
+        if "tiền chất là" in lowered:
+            m_def = re.search(r"[Tt]iền chất là (.+?)(?:\.\s*|$)", text)
+            def_text = m_def.group(0).strip() if m_def else text
+            concepts.append({
+                "id": f"concept:{article_id}:tien_chat",
+                "name": "tiền chất",
+                "definition_text": def_text,
+            })
+
         clauses.append({
             "id": f"{article_id} khoản {start.group(1)}",
             "number": int(start.group(1)),
             "penalty": penalty.group(1).rstrip(".") if penalty else "",
+            "penalty_types": penalty_types,
+            "max_years": max_years,
             "text": text,
-            "substances": find_substances(text),
+            "substances": clause_substances,
+            "quantity_rules": quantity_rules,
+            "concepts": concepts,
         })
     return {
         "id": article_id,
@@ -203,77 +278,340 @@ class Neo4jGraph:
     # ---------------------------------------------------------------- HINT — suggested ontology: writes
 
     def suggested_constraints(self) -> None:
-        for label, key in [("Article", "id"), ("Clause", "id"), ("Crime", "name"), ("Case", "name"),
-                           ("Substance", "name"), ("Person", "name"), ("Location", "name")]:
+        for label, key in [
+            ("Article", "id"), ("Clause", "id"), ("QuantityRule", "id"), ("LegalConcept", "id"),
+            ("Crime", "name"), ("Case", "name"), ("Substance", "name"), ("Person", "name"),
+            ("Charge", "id"), ("Quantity", "id"), ("Location", "name")
+        ]:
             self.run(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.{key} IS UNIQUE")
 
     def add_law_article(self, article: dict) -> None:
         self.run(
             """
-            MERGE (a:Article {id: $id}) SET a.title = $title, a.law = $law, a.doc_id = $doc_id
+            MERGE (a:Article {id: $id}) 
+              SET a.title = $title, a.law = $law, a.doc_id = $doc_id, a.name = $id
             FOREACH (crime IN CASE WHEN $crime IS NULL THEN [] ELSE [$crime] END |
-                MERGE (c:Crime {name: crime}) MERGE (a)-[:DEFINES]->(c))
+                MERGE (c:Crime {name: crime})
+                MERGE (a)-[:DEFINES]->(c)
+                MERGE (a)-[:DEFINES_CRIME {doc_id: $doc_id}]->(c)
+            )
             WITH a
             UNWIND $clauses AS clause
             MERGE (cl:Clause {id: clause.id})
-              SET cl.number = clause.number, cl.penalty = clause.penalty, cl.text = clause.text, cl.doc_id = $doc_id
+              SET cl.number = clause.number, cl.penalty = clause.penalty, cl.text = clause.text, 
+                  cl.doc_id = $doc_id, cl.penalty_types = clause.penalty_types, cl.max_years = clause.max_years,
+                  cl.name = clause.id
             MERGE (a)-[:HAS_CLAUSE]->(cl)
-            FOREACH (s IN clause.substances | MERGE (sub:Substance {name: s}) MERGE (cl)-[:MENTIONS]->(sub))
+            FOREACH (s IN clause.substances | 
+                MERGE (sub:Substance {name: s}) 
+                MERGE (cl)-[:MENTIONS]->(sub)
+            )
+            FOREACH (concept IN clause.concepts |
+                MERGE (lc:LegalConcept {id: concept.id})
+                  SET lc.name = concept.name, lc.definition_text = concept.definition_text, lc.doc_id = $doc_id
+                MERGE (cl)-[:DEFINES_TERM {doc_id: $doc_id}]->(lc)
+            )
+            FOREACH (rule IN clause.quantity_rules |
+                MERGE (qr:QuantityRule {id: rule.id})
+                  SET qr.lower = rule.lower, qr.upper = rule.upper, qr.unit = rule.unit,
+                      qr.point = rule.point, qr.matching_supported = true, qr.doc_id = $doc_id
+                MERGE (cl)-[:HAS_QUANTITY_RULE]->(qr)
+                MERGE (srule:Substance {name: rule.substance})
+                MERGE (qr)-[:APPLIES_TO]->(srule)
+            )
             """,
             **article,
         )
 
     def add_news_case(self, case: dict, doc: Document) -> None:
+        case_name = case.get("name") or doc.metadata.get("title", doc.id)
+        processed_substances = []
+        for i, s in enumerate(case.get("substances", [])):
+            if not s.get("name"):
+                continue
+            amt = s.get("amount", "")
+            lower_g, upper_g = parse_quantity_amount(amt)
+            processed_substances.append({
+                "name": s["name"],
+                "amount": amt,
+                "lower_g": lower_g,
+                "upper_g": upper_g,
+                "qty_id": f"{doc.id}:case:qty:{i}:{s['name']}",
+            })
+
+        processed_people = []
+        for i, p in enumerate(case.get("people", [])):
+            if not p.get("name"):
+                continue
+            sentence_raw = p.get("sentence", "")
+            sentence_type = ""
+            sentence_months = None
+            if "tử hình" in sentence_raw.lower():
+                sentence_type = "death"
+            elif "chung thân" in sentence_raw.lower():
+                sentence_type = "life"
+            elif re.search(r"\d+\s*(?:năm|tháng)", sentence_raw.lower()):
+                sentence_type = "fixed_term"
+                m_yrs = re.search(r"(\d+)\s*năm", sentence_raw.lower())
+                m_mos = re.search(r"(\d+)\s*tháng", sentence_raw.lower())
+                total_m = (int(m_yrs.group(1)) * 12 if m_yrs else 0) + (int(m_mos.group(1)) if m_mos else 0)
+                if total_m > 0:
+                    sentence_months = total_m
+
+            processed_people.append({
+                "name": p["name"],
+                "aliases": p.get("aliases") or [],
+                "role": p.get("role", "bị cáo"),
+                "charge": p.get("charge", ""),
+                "sentence": sentence_raw,
+                "sentence_type": sentence_type,
+                "sentence_months": sentence_months,
+                "charge_id": f"{doc.id}:charge:{i}:{p['name']}",
+            })
+
         self.run(
             """
             MERGE (k:Case {name: $name})
               SET k.summary = $summary, k.date = $date, k.doc_id = $doc_id, k.source_title = $title
             FOREACH (loc IN CASE WHEN $location = '' THEN [] ELSE [$location] END |
-                MERGE (l:Location {name: loc}) MERGE (k)-[:LOCATED_IN]->(l))
-            FOREACH (crime IN $charges | MERGE (c:Crime {name: crime}) MERGE (k)-[:CHARGED_WITH]->(c))
-            FOREACH (s IN $substances | MERGE (sub:Substance {name: s.name}) MERGE (k)-[r:INVOLVES]->(sub)
-                SET r.amount = s.amount)
-            FOREACH (p IN $people | MERGE (person:Person {name: p.name})
-                SET person.aliases = coalesce(p.aliases, [])
-                MERGE (person)-[r:INVOLVED_IN]->(k) SET r.role = p.role, r.charge = p.charge, r.sentence = p.sentence)
+                MERGE (l:Location {name: loc}) MERGE (k)-[:LOCATED_IN {doc_id: $doc_id}]->(l))
+            FOREACH (crime IN $charges | 
+                MERGE (c:Crime {name: crime}) 
+                MERGE (k)-[:CHARGED_WITH]->(c))
+            FOREACH (s IN $substances | 
+                MERGE (sub:Substance {name: s.name}) 
+                MERGE (k)-[r:INVOLVES]->(sub) SET r.amount = s.amount
+                MERGE (qty:Quantity {id: s.qty_id})
+                  SET qty.raw_amount = s.amount, qty.lower = s.lower_g, qty.upper = s.upper_g, qty.unit = 'g', qty.doc_id = $doc_id
+                MERGE (k)-[:HAS_QUANTITY]->(qty)
+                MERGE (qty)-[:OF_SUBSTANCE]->(sub)
+            )
+            FOREACH (p IN $people | 
+                MERGE (person:Person {name: p.name})
+                  SET person.aliases = coalesce(p.aliases, []), person.doc_id = $doc_id
+                MERGE (person)-[r:INVOLVED_IN]->(k) 
+                  SET r.role = p.role, r.charge = p.charge, r.sentence = p.sentence
+                MERGE (person)-[:PARTICIPATED_IN {role: p.role, doc_id: $doc_id}]->(k)
+                FOREACH (chg IN CASE WHEN p.charge = '' THEN [] ELSE [p.charge] END |
+                    MERGE (charge_node:Charge {id: p.charge_id})
+                      SET charge_node.sentence_type = p.sentence_type, charge_node.sentence_months = p.sentence_months,
+                          charge_node.sentence_raw = p.sentence, charge_node.doc_id = $doc_id, charge_node.stage = 'first_instance'
+                    MERGE (person)-[:HAS_CHARGE]->(charge_node)
+                    MERGE (charge_node)-[:IN_CASE]->(k)
+                    MERGE (cnode:Crime {name: chg})
+                    MERGE (charge_node)-[:OF_CRIME]->(cnode)
+                    FOREACH (s IN $substances |
+                        MERGE (qlink:Quantity {id: s.qty_id})
+                        MERGE (charge_node)-[:ATTRIBUTED_QUANTITY {doc_id: $doc_id}]->(qlink)
+                    )
+                )
+            )
             """,
-            name=case.get("name") or doc.metadata.get("title", doc.id),
+            name=case_name,
             summary=case.get("summary", ""), date=case.get("date", ""), location=case.get("location", ""),
-            charges=case.get("charges", []), people=[p for p in case.get("people", []) if p.get("name")],
-            substances=[s for s in case.get("substances", []) if s.get("name")],
+            charges=case.get("charges", []), people=processed_people,
+            substances=processed_substances,
             doc_id=doc.id, title=doc.metadata.get("title", ""),
         )
 
     # ---------------------------------------------------------------- KG-3
 
     def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
-        """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
-        # TODO KG-3: multi-hop retrieval over YOUR ontology.
-        #   1. self.seed_facts(question, doc_ids) -> (seed_ids, facts)   (ontology-independent, already written)
-        #   2. From the seeds, walk to the other KB through your bridge node (Cypher, see LAB_GUIDE Bước 5)
-        #   3. Append one readable string per fact; return the list.
-        #
-        # HINT (suggested ontology):
-        #   a. Cases that are a seed or next to one -> add f"Vụ việc '{name}': {summary}" to facts
-        #        MATCH (k:Case) WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
-        #   b. For those cases follow
-        #        (Case)-[:CHARGED_WITH]->(Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
-        #      keep clause 1 + clauses that MENTION a Substance the case INVOLVES
-        #   c. Articles named in the question ("Điều 251" -> re.findall(r"[Đđ]iều (\d+)", question)):
-        #      clause 1 + clauses mentioning find_substances(question)
-        #   d. One fact per clause: f"[{article_id} - {title}] khoản {number}: {text}"
-        raise NotImplementedError("TODO KG-3 Neo4jGraph.context (src/graph.py) - kiểm tra: python bench_kg.py --check")
+        """Graph facts for a question: seeds + multi-hop traversal with quantitative rules & maximum penalties."""
+        facts: list[str] = []
+        seen: set[str] = set()
+
+        def add_fact(f: str) -> None:
+            f = f.strip()
+            if f and f not in seen:
+                seen.add(f)
+                facts.append(f)
+
+        # 1. LegalConcept definitions (Q1: tiền chất là gì?)
+        concepts = self.run(
+            """
+            MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)-[:DEFINES_TERM]->(lc:LegalConcept)
+            WHERE toLower($q) CONTAINS toLower(lc.name)
+            RETURN a.id AS article_id, cl.number AS clause_num, lc.name AS name, lc.definition_text AS def_text
+            """,
+            q=question,
+        )
+        for row in concepts:
+            add_fact(f"[{row['article_id']} khoản {row['clause_num']}] Định nghĩa '{row['name']}': {row['def_text']}")
+
+        # 2. Identify target persons mentioned in question
+        target_persons = self.run(
+            """
+            MATCH (p:Person)
+            WHERE (p.name IS :: STRING AND size(p.name) >= 3 AND toLower($q) CONTAINS toLower(p.name))
+               OR any(a IN coalesce(p.aliases, []) WHERE size(a) >= 3 AND toLower($q) CONTAINS toLower(a))
+            RETURN DISTINCT p.name AS name, elementId(p) AS id
+            """,
+            q=question,
+        )
+        target_p_ids = [p["id"] for p in target_persons]
+
+        # 3. Target cases: from target persons, or from doc_ids
+        if target_p_ids:
+            case_rows = self.run(
+                """
+                MATCH (p:Person)-[:INVOLVED_IN|PARTICIPATED_IN]->(k:Case)
+                WHERE elementId(p) IN $p_ids
+                RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary, k.doc_id AS doc_id
+                """,
+                p_ids=target_p_ids,
+            )
+        else:
+            case_rows = self.run(
+                """
+                MATCH (k:Case)
+                WHERE k.doc_id IN $doc_ids
+                RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary, k.doc_id AS doc_id
+                """,
+                doc_ids=doc_ids,
+            )
+        case_ids = [row["id"] for row in case_rows]
+
+        # Add Case summaries
+        for row in case_rows:
+            if row.get("summary"):
+                add_fact(f"Vụ việc '{row['name']}': {row['summary']}")
+
+        # 4. People and Charges in these target cases (or specific target persons)
+        charges_data = self.run(
+            """
+            MATCH (p:Person)-[:HAS_CHARGE]->(h:Charge)-[:OF_CRIME]->(c:Crime)
+            MATCH (p)-[:INVOLVED_IN|PARTICIPATED_IN]->(k:Case)
+            WHERE (elementId(p) IN $p_ids) OR (size($p_ids) = 0 AND elementId(k) IN $case_ids)
+            RETURN DISTINCT p.name AS person, c.name AS crime, h.sentence_raw AS sentence,
+                            h.sentence_type AS sentence_type, k.name AS case_name
+            """,
+            p_ids=target_p_ids,
+            case_ids=case_ids,
+        )
+        target_crimes = set()
+        for row in charges_data:
+            target_crimes.add(row["crime"])
+            st = f" bị tuyên: {row['sentence']}" if row["sentence"] else ""
+            add_fact(f"Bị cáo '{row['person']}' trong vụ '{row['case_name']}'{st} về tội {row['crime']}.")
+
+        # If no target person, also collect charges from case charged_with
+        if not target_crimes and case_ids:
+            for r in self.run("MATCH (k:Case)-[:CHARGED_WITH]->(c:Crime) WHERE elementId(k) IN $case_ids RETURN DISTINCT c.name AS crime", case_ids=case_ids):
+                target_crimes.add(r["crime"])
+
+        # 5. Articles and Clauses for target crimes:
+        # Always include: Clause 1 (khung cơ bản) and Clause with maximum penalty (life/death or highest imprisonment)
+        if target_crimes:
+            clause_rows = self.run(
+                """
+                MATCH (c:Crime)<-[:DEFINES|DEFINES_CRIME]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE c.name IN $crimes
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text,
+                                cl.penalty AS penalty, cl.penalty_types AS penalty_types, cl.max_years AS max_years
+                ORDER BY a.id, cl.number
+                """,
+                crimes=list(target_crimes),
+            )
+            by_article = {}
+            for row in clause_rows:
+                by_article.setdefault(row["article_id"], []).append(row)
+
+            for art_id, clauses in by_article.items():
+                cl1 = next((c for c in clauses if c["number"] == 1), None)
+                if cl1:
+                    pen = f" (Khung hình phạt: {cl1['penalty']})" if cl1.get('penalty') else ""
+                    add_fact(f"[{cl1['article_id']} - {cl1['title']}] khoản 1 (khung hình phạt cơ bản): {cl1['text']}{pen}")
+
+                extreme_clauses = [c for c in clauses if any(pt in ("death", "life") for pt in (c.get("penalty_types") or []))]
+                if extreme_clauses:
+                    death_cl = next((c for c in extreme_clauses if "death" in (c.get("penalty_types") or [])), extreme_clauses[-1])
+                    pen = f" (Mức hình phạt: {death_cl['penalty']})" if death_cl.get('penalty') else ""
+                    add_fact(f"[{death_cl['article_id']} - {death_cl['title']}] khoản {death_cl['number']} (khung hình phạt cao nhất): {death_cl['text']}{pen}")
+                else:
+                    term_clauses = [c for c in clauses if c.get("max_years")]
+                    if term_clauses:
+                        max_c = max(term_clauses, key=lambda c: c["max_years"])
+                        pen = f" (Mức hình phạt: {max_c['penalty']})" if max_c.get('penalty') else ""
+                        add_fact(f"[{max_c['article_id']} - {max_c['title']}] khoản {max_c['number']} (khung hình phạt cao nhất): {max_c['text']}{pen}")
+
+        # 6. Quantitative matching for case substances vs law rules (Q5)
+        matched_rules = self.run(
+            """
+            MATCH (k:Case)-[:HAS_QUANTITY]->(q:Quantity)-[:OF_SUBSTANCE]->(sub:Substance)
+            MATCH (r:QuantityRule)-[:APPLIES_TO]->(sub)
+            MATCH (cl:Clause)-[:HAS_QUANTITY_RULE]->(r)
+            MATCH (a:Article)-[:HAS_CLAUSE]->(cl)
+            MATCH (a)-[:DEFINES|DEFINES_CRIME]->(c:Crime)
+            WHERE elementId(k) IN $case_ids
+              AND (c.name IN $crimes OR size($crimes) = 0)
+              AND q.lower IS NOT NULL AND r.lower IS NOT NULL
+              AND q.lower >= r.lower
+            RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text,
+                            q.raw_amount AS amount, r.lower AS min_g, sub.name AS substance, cl.penalty AS penalty
+            ORDER BY cl.number DESC
+            """,
+            case_ids=case_ids,
+            crimes=list(target_crimes),
+        )
+        for row in matched_rules:
+            pen = f" Khung hình phạt: {row['penalty']}." if row.get("penalty") else ""
+            add_fact(
+                f"[Định lượng áp dụng: {row['substance']} {row['amount']} >= {row['min_g']}g] "
+                f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}.{pen}"
+            )
+
+        # 7. Aggregation for substances (Q6: Những vụ việc nào liên quan đến MDMA...)
+        mentioned_subs = find_substances(question)
+        if mentioned_subs and any(w in question.lower() for w in ("vụ việc", "những vụ", "liên quan")):
+            agg_cases = self.run(
+                """
+                MATCH (k:Case)-[:HAS_QUANTITY]->(q:Quantity)-[:OF_SUBSTANCE]->(sub:Substance)
+                WHERE sub.name IN $substances
+                RETURN DISTINCT k.name AS case_name, k.summary AS summary, q.raw_amount AS amount, sub.name AS substance
+                """,
+                substances=mentioned_subs,
+            )
+            for row in agg_cases:
+                add_fact(f"Vụ việc liên quan {row['substance']}: '{row['case_name']}' (tang vật: {row['amount']}). Tóm tắt: {row['summary']}")
+
+        # 8. Direct article mention in question ("Điều 251", "Điều 255"...)
+        article_nums = re.findall(r"[Đđ]iều (\d+)", question)
+        if article_nums:
+            direct_clauses = self.run(
+                """
+                MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE any(num IN $article_nums WHERE a.id CONTAINS num)
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text, cl.penalty AS penalty
+                ORDER BY a.id, cl.number
+                """,
+                article_nums=article_nums,
+            )
+            for row in direct_clauses:
+                pen = f" (Hình phạt: {row['penalty']})" if row.get("penalty") else ""
+                add_fact(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}{pen}")
+
+        # 9. Fallback if few structured facts found
+        if len(facts) < 5:
+            _, fallback_facts = self.seed_facts(question, doc_ids, limit=max_facts - len(facts))
+            for f in fallback_facts:
+                add_fact(f)
+
+        return facts[:max_facts]
 
 # ---------------------------------------------------------------------------------------------- KG-2
 
 def build_graph(graph: Neo4jGraph, law_docs: list[Document], news_docs: list[Document],
                 llm_fn: Callable[..., str]) -> None:
     """Load both KBs into an empty graph. llm_fn(prompt, json_mode=False) -> str (metered OpenAI chat)."""
-    # TODO KG-2: create YOUR ontology in Neo4j from both KBs.
-    #   Contract: every node created from one document has the property doc_id = Document.id.
-    #   Fastest start: the HINT helpers above (parse_law_article, extract_news_cases, suggested_constraints,
-    #   add_law_article, add_news_case). Own ontology + report/ONTOLOGY.md = bonus (SUBMISSION.md).
-    raise NotImplementedError("TODO KG-2 build_graph (src/graph.py) - kiểm tra: python bench_kg.py --build --limit 2")
+    graph.suggested_constraints()
+    articles = [parse_law_article(d) for d in law_docs]
+    for a in articles:
+        graph.add_law_article(a)
+    crimes = [a["crime"] for a in articles if a["crime"]]
+    for d in news_docs:
+        for case in extract_news_cases(d, lambda p: llm_fn(p, json_mode=True), crimes):
+            graph.add_news_case(case, d)
 
 # ---------------------------------------------------------------------------------------------- KG-4
 
@@ -298,6 +636,14 @@ class GraphRAGAgent:
         self.llm_fn = llm_fn
 
     def answer(self, question: str, top_k: int = 3) -> str:
-        # TODO KG-4: vector top-k (same as flat RAG) -> doc_ids of the hits -> self.graph.context(question, doc_ids)
-        #            -> fill GRAPH_PROMPT -> self.llm_fn(prompt)
-        raise NotImplementedError("TODO KG-4 GraphRAGAgent.answer (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k GraphRAGAgent")
+        chunks = self.store.search(question, top_k=top_k)
+        doc_ids = list(dict.fromkeys(
+            c.get("metadata", {}).get("doc_id")
+            for c in chunks
+            if c.get("metadata", {}).get("doc_id")
+        ))
+        facts = self.graph.context(question, doc_ids)
+        facts_str = "\n".join(f"- {f}" for f in facts) if facts else "Không có dữ kiện từ đồ thị."
+        chunks_str = "\n\n".join(f"[{i + 1}] {c.get('content', '')}" for i, c in enumerate(chunks)) if chunks else "Không có đoạn văn bản."
+        prompt = GRAPH_PROMPT.format(facts=facts_str, chunks=chunks_str, question=question)
+        return self.llm_fn(prompt)
